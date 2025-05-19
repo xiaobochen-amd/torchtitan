@@ -20,6 +20,7 @@ from torchtitan.protocols.train_spec import BaseModelArgs, ModelProtocol
 
 
 import aiter
+from torchtitan.models.llama3.rope import TEFusedRoPEFunc
 
 @dataclass
 class TransformerModelArgs(BaseModelArgs):
@@ -105,6 +106,17 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Te
     freqs = torch.outer(t, freqs).float()
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
+
+def precompute_freqs_cis_for_te(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+    """
+    Precompute frequency angles for TE's FusedRoPEFunc (real-valued tensor).
+    Output shape: [S, 1, 1, D]
+    """
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))  # shape: [D/2]
+    t = torch.arange(end).float()  # shape: [S]
+    angles = torch.outer(t, freqs)  # shape: [S, D/2]
+    freqs_full = torch.cat([angles, angles], dim=-1)  # → shape: [S, D]
+    return freqs_full.view(end, 1, 1, dim).to(torch.float32)
 
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -207,15 +219,16 @@ class Attention(nn.Module):
         self.wq = nn.Linear(
             model_args.dim, model_args.n_heads * self.head_dim, bias=False
         )
-        self.wk = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wkv = nn.Linear(model_args.dim, 2 * self.n_kv_heads * self.head_dim, bias=False)
+        
         self.wo = nn.Linear(
             model_args.n_heads * self.head_dim, model_args.dim, bias=False
         )
+        self.kv_size = self.n_kv_heads * self.head_dim
 
     def init_weights(self, init_std: float):
-        for linear in (self.wq, self.wk, self.wv):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.wq.weight, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.wkv.weight, mean=0.0, std=0.02)
         nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
 
     def forward(
@@ -236,7 +249,9 @@ class Attention(nn.Module):
         """
 
         bs, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq = self.wq(x)
+        xkv = self.wkv(x)
+        xk, xv = xkv.split([self.kv_size, self.kv_size], dim=-1)
 
         # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
         # local heads from sizes of xq, xk, and xv as TP may have sharded them
@@ -245,13 +260,15 @@ class Attention(nn.Module):
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        # xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)        
+        xq = TEFusedRoPEFunc.apply(xq, freqs_cis)
+        xk = TEFusedRoPEFunc.apply(xk, freqs_cis)
+        
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
 
-        # output, _ = aiter.flash_attn_func(xq, xk, xv, causal=True, return_lse=True, deterministic=False)
         output, _ = aiter.flash_attn_func(xq, keys, values, causal=True, return_lse=True, deterministic=False)
 
         output = output.view(bs, seqlen, -1)
@@ -449,7 +466,7 @@ class Transformer(nn.Module, ModelProtocol):
             )
 
     def _precompute_freqs_cis(self) -> torch.Tensor:
-        return precompute_freqs_cis(
+        return precompute_freqs_cis_for_te(
             self.model_args.dim // self.model_args.n_heads,
             # Need to compute until at least the max token limit for generation
             # TODO: explain in docs/composability.md why we removed the 2x
