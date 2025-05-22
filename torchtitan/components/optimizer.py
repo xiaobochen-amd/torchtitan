@@ -16,6 +16,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim import Optimizer
+import torchao
 
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config_manager import JobConfig
@@ -280,10 +281,14 @@ def build_optimizers(
         "fused": fused,
         "foreach": foreach,
     }
+    if name == "AdamWFp8":
+        del optimizer_kwargs["fused"]
+        del optimizer_kwargs["foreach"]
 
     optimizer_classes = {
         "Adam": torch.optim.Adam,
         "AdamW": torch.optim.AdamW,
+        "AdamWFp8": torchao.optim.AdamWFp8,
     }
     if name not in optimizer_classes:
         raise NotImplementedError(f"Optimizer {name} not added.")
