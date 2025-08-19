@@ -13,6 +13,7 @@ from torch import nn
 
 from torchtitan.distributed.expert_parallel import expert_parallel
 
+import primus_turbo.pytorch as turbo
 
 @dataclass
 class MoEArgs:
@@ -109,18 +110,19 @@ def _run_experts_grouped_mm(
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
 ) -> torch.Tensor:
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-    # grouped mm between a 2D tensor and a 3D tensor
     assert x.dim() == 2
-
+    
+    num_tokens_per_expert = num_tokens_per_expert.to(torch.int64)
+    
     h = F.silu(
-        torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
+        turbo.ops.grouped_gemm(x.bfloat16(), w1.bfloat16(), group_lens=num_tokens_per_expert, trans_b=True)
     )
-    h = h * torch._grouped_mm(
-        x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets
+    h = h * turbo.ops.grouped_gemm(
+        x.bfloat16(), w3.bfloat16(), group_lens=num_tokens_per_expert, trans_b=True
     )
-    out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
-
+    
+    out = turbo.ops.grouped_gemm(h, w2.bfloat16(), group_lens=num_tokens_per_expert, trans_b=True).type_as(x)
+    
     return out
 
 
